@@ -1,0 +1,10 @@
+com\getnovels\crawl\CrawlRequest.class
+com\getnovels\crawl\DownloadRequest.class
+com\getnovels\CorsConfig$1.class
+com\getnovels\crawl\CrawlController.class
+com\getnovels\crawl\DownloadResponse.class
+com\getnovels\crawl\CrawlRequest$Credentials.class
+com\getnovels\CorsConfig.class
+com\getnovels\crawl\CrawlResponse.class
+com\getnovels\crawl\CrawlResponse$NovelCandidate.class
+com\getnovels\GetNovelsApplication.class
