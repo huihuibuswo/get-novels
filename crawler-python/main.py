@@ -147,7 +147,6 @@ proxy_manager = ProxyManager()
 
 MAX_INDEX_PAGES = 30
 MAX_NOVEL_DETAIL_PAGES = 60
-MAX_CHAPTERS = 35
 TIMEOUT_SECONDS = 15
 MAX_REDIRECTS = 5
 MIN_REQUEST_INTERVAL_SECONDS = 1.0
@@ -329,35 +328,53 @@ def download_novel(request: DownloadRequest) -> DownloadResponse:
     soup = clean_soup(page.text)
     title = request.title or extract_title(page.url, soup)
     root_host = urlparse(str(request.url)).netloc
-    chapter_links = extract_chapter_links(page.url, soup, root_host)
-    catalog_url = extract_catalog_url(page.url, soup, root_host)
-    if catalog_url:
-        try:
-            catalog_page = fetch(session, catalog_url)
-            catalog_soup = clean_soup(catalog_page.text)
-            chapter_links = unique_urls(chapter_links + extract_chapter_links(catalog_page.url, catalog_soup, root_host))
-        except requests.RequestException:
-            pass
-
     chapters: list[tuple[str, str]] = []
-    if chapter_links:
-        for chapter_url in chapter_links[:MAX_CHAPTERS]:
+    start_chapter_url = find_start_chapter_url(page.url, soup, root_host)
+    
+    if not start_chapter_url:
+        catalog_url = extract_catalog_url(page.url, soup, root_host)
+        if catalog_url:
             try:
-                chapter_page = fetch(session, chapter_url, referer=str(request.url))
+                catalog_page = fetch(session, catalog_url)
+                catalog_soup = clean_soup(catalog_page.text)
+                start_chapter_url = find_start_chapter_url(catalog_page.url, catalog_soup, root_host)
+                if not start_chapter_url:
+                    links = extract_chapter_links(catalog_page.url, catalog_soup, root_host)
+                    if links:
+                        start_chapter_url = links[-1] if len(links) > 1 and "第" in links[-1] else links[0]
             except requests.RequestException:
-                continue
+                pass
+
+    if not start_chapter_url:
+        links = extract_chapter_links(page.url, soup, root_host)
+        if links:
+            start_chapter_url = links[-1] if len(links) > 20 else links[0]
+
+    if start_chapter_url:
+        current_url = start_chapter_url
+        seen_urls = set()
+        
+        while current_url and current_url not in seen_urls:
+            seen_urls.add(current_url)
+            try:
+                chapter_page = fetch(session, current_url, referer=str(request.url))
+            except requests.RequestException:
+                break
+                
             if is_chapter_blocked(chapter_page):
                 raise HTTPException(
                     status_code=403,
                     detail=f"章节阅读页触发了验证码/人工验证，已停止生成错误 TXT。请先在浏览器打开验证页完成验证后重试：{chapter_page.url}",
                 )
+                
             chapter_soup = clean_soup(chapter_page.text)
             chapter_title = extract_title(chapter_page.url, chapter_soup)
             chapter_text = extract_main_text(chapter_soup)
+            
             if is_valid_chapter_text(chapter_title, chapter_text):
                 chapters.append((chapter_title, chapter_text))
-            if len(chapters) >= MAX_CHAPTERS:
-                break
+                
+            current_url = find_next_page_url(chapter_page.url, chapter_soup, root_host)
     else:
         page_text = extract_main_text(soup)
         if is_valid_chapter_text(title, page_text):
@@ -704,6 +721,38 @@ def unique_urls(urls: list[str]) -> list[str]:
     return result
 
 
+def find_start_chapter_url(page_url: str, soup: BeautifulSoup, root_host: str) -> Optional[str]:
+    for tag in soup.find_all("a", href=True):
+        text = tag.get_text(" ").strip()
+        if any(w in text for w in ("开始阅读", "免费阅读", "点击阅读", "立即阅读")):
+            href = normalize_url(urljoin(page_url, tag["href"]))
+            if urlparse(href).netloc == root_host:
+                return href
+    for tag in soup.find_all("a", href=True):
+        text = tag.get_text(" ").strip()
+        if "最新" in text or "倒序" in text:
+            continue
+        if any(w in text for w in ("第一章", "第1章", "楔子", "序章")):
+            href = normalize_url(urljoin(page_url, tag["href"]))
+            if urlparse(href).netloc == root_host:
+                return href
+    return None
+
+
+def find_next_page_url(page_url: str, soup: BeautifulSoup, root_host: str) -> Optional[str]:
+    for tag in soup.find_all("a", href=True):
+        text = tag.get_text(" ").strip()
+        if any(w in text for w in ("下一章", "下一页", "下一回")):
+            if "目录" in text or "书签" in text or "末页" in text:
+                continue
+            href = normalize_url(urljoin(page_url, tag["href"]))
+            parsed = urlparse(href)
+            if parsed.scheme in ("http", "https") and parsed.netloc == root_host:
+                if not is_catalog_link(text, href):
+                    return href
+    return None
+
+
 def extract_catalog_url(page_url: str, soup: BeautifulSoup, root_host: str) -> Optional[str]:
     for tag in soup.find_all("a", href=True):
         text = " ".join(tag.get_text(" ").split())
@@ -962,10 +1011,15 @@ def clean_tag_label(value: str) -> str:
 def is_clean_short_label(label: str, max_len: int) -> bool:
     if not label or len(label) > max_len:
         return False
-    blocked = ("首页", "小说", "目录", "章节", "最新", "登录", "注册", "更多", "More", "默认", "作者", "标签")
-    if label in blocked or any(mark in label for mark in ("第", "章", "最新章节")):
+    # 过滤纯数字
+    if re.fullmatch(r"\d+", label):
         return False
-    if re.search(r"[，。！？、,.!?/\\|:：；;（）()《》“”\"' ]", label):
+    blocked = ("首页", "小说", "目录", "章节", "最新", "登录", "注册", "更多", "More", "默认", "作者", "标签",
+               "下一页", "上一页", "末页", "尾页", "返回", "全部", "排行", "最近更新", "本站",
+               "网站", "搜索", "收藏", "书签", "设置", "帮助")
+    if label in blocked or any(mark in label for mark in ("第", "章", "最新章节", "下一", "上一")):
+        return False
+    if re.search(r"[，。！？、,.!?/\\|:：；;（）()《》\u201c\u201d\"' ]", label):
         return False
     return True
 

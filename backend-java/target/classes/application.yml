@@ -1,5 +1,0 @@
-server:
-  port: 8080
-
-crawler:
-  base-url: ${CRAWLER_BASE_URL:http://127.0.0.1:8001}

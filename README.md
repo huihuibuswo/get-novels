@@ -5,12 +5,12 @@
 ## 结构
 
 - `frontend`：React + TypeScript + Zustand + Vite + Tailwind
-- `backend-java`：Spring Boot API，暴露 `/api/index` 和 `/api/download`
 - `crawler-python`：FastAPI 爬虫服务，负责登录尝试、站内扫描、小说候选识别和 TXT 格式化
 
 ## 启动
 
 ```powershell
+# 1. 启动爬虫服务 (默认端口 8001)
 cd crawler-python
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
@@ -18,11 +18,7 @@ python -m venv .venv
 ```
 
 ```powershell
-cd backend-java
-mvn spring-boot:run
-```
-
-```powershell
+# 2. 启动前端服务 (默认端口 5173，接口会自动代理至爬虫服务 8001 端口)
 cd frontend
 npm install
 npm run dev
