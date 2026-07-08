@@ -393,8 +393,10 @@ def download_novel(request: DownloadRequest) -> DownloadResponse:
 
 
 def build_session() -> requests.Session:
-    # 启用 curl_cffi 并配置 Chrome 模拟
-    session = Session(impersonate="chrome")
+    # 随机选择浏览器类型和版本指纹以应对更严格的风控
+    impersonate_targets = ["chrome", "edge", "safari", "chrome110", "edge101", "safari15.5"]
+    selected_impersonate = random.choice(impersonate_targets)
+    session = Session(impersonate=selected_impersonate)
     session.headers.update({
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
