@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
 type NovelCandidate = {
   title: string;
   url: string;
@@ -87,7 +89,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
 
     set({ loading: true, error: '', downloadResult: null });
     try {
-      const response = await fetch('/api/index', {
+      const response = await fetch(`${API_BASE_URL || '/api'}/index`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, credentials }),
@@ -115,7 +117,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
     const { username, password, showLogin } = get();
     set({ downloadingUrl: novel.url, error: '', captchaUrl: '', downloadResult: null });
     try {
-      const response = await fetch('/api/download', {
+      const response = await fetch(`${API_BASE_URL || '/api'}/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
