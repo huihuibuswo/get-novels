@@ -19,6 +19,7 @@ from curl_cffi.requests.errors import RequestsError
 from fake_useragent import UserAgent
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 # Monkey Patch 异常与属性以便完美向下兼容
@@ -43,6 +44,23 @@ Response.apparent_encoding = property(_get_apparent_encoding)
 Response.encoding = property(Response.encoding.fget, lambda self, val: setattr(self, "_encoding", val))
 
 app = FastAPI(title="Get Novels Crawler")
+
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
+
+
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
 
 # 初始化动态 User-Agent 生成器，并准备好兜底机制
 try:
