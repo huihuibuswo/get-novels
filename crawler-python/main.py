@@ -4,10 +4,14 @@ import socket
 import random
 import time
 import threading
+import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
 from ipaddress import ip_address
 from collections import deque
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib import robotparser
 
 from dotenv import load_dotenv
@@ -165,6 +169,10 @@ proxy_manager = ProxyManager()
 
 MAX_INDEX_PAGES = 30
 MAX_NOVEL_DETAIL_PAGES = 60
+MAX_SEARCH_RESULTS = 20
+MAX_SOURCE_CHECKS = 10
+MAX_CHAPTER_LIST_SIZE = 3000
+MAX_CHAPTER_PAGES = 10
 TIMEOUT_SECONDS = 15
 MAX_REDIRECTS = 5
 MIN_REQUEST_INTERVAL_SECONDS = 1.0
@@ -210,7 +218,22 @@ class CrawlRequest(BaseModel):
 class DownloadRequest(BaseModel):
     url: HttpUrl
     title: Optional[str] = None
+    expectedChapterCount: Optional[int] = None
+    chapterUrls: Optional[list[HttpUrl]] = None
     credentials: Optional[Credentials] = None
+
+
+class NovelSearchRequest(BaseModel):
+    query: str
+
+
+class SourceSearchRequest(BaseModel):
+    title: str
+
+
+class ChapterListRequest(BaseModel):
+    url: HttpUrl
+    title: Optional[str] = None
 
 
 class NovelCandidate(BaseModel):
@@ -239,6 +262,149 @@ class DownloadResponse(BaseModel):
     filename: str
     content: str
     chapterCount: int
+
+
+class WebNovelCandidate(BaseModel):
+    title: str
+    description: str
+    matchScore: int
+    sourceCount: int
+
+
+class NovelSearchResponse(BaseModel):
+    query: str
+    novels: list[WebNovelCandidate]
+
+
+class DownloadSource(BaseModel):
+    siteName: str
+    url: str
+    description: str
+    chapterHints: int
+
+
+class SourceSearchResponse(BaseModel):
+    title: str
+    sources: list[DownloadSource]
+
+
+class ChapterEntry(BaseModel):
+    title: str
+    url: str
+
+
+class ChapterListResponse(BaseModel):
+    title: str
+    sourceUrl: str
+    chapters: list[ChapterEntry]
+
+
+@app.post("/search/novels")
+def search_novels(request: NovelSearchRequest) -> NovelSearchResponse:
+    query = normalize_search_text(request.query, "小说名称")
+    results = web_search(f'"{query}" 小说', relevance_query=query)
+    grouped: dict[str, WebNovelCandidate] = {}
+    for result_title, _, description in results:
+        title = extract_search_novel_title(result_title, query)
+        score = fuzzy_match_score(query, title)
+        if score < 55:
+            continue
+        key = normalize_title_key(title)
+        if not key:
+            continue
+        existing = grouped.get(key)
+        if existing:
+            existing.sourceCount += 1
+            if len(description) > len(existing.description):
+                existing.description = description
+            existing.matchScore = max(existing.matchScore, score)
+        else:
+            grouped[key] = WebNovelCandidate(
+                title=title,
+                description=description[:240],
+                matchScore=score,
+                sourceCount=1,
+            )
+    novels = sorted(grouped.values(), key=lambda item: (item.matchScore, item.sourceCount), reverse=True)[:12]
+    return NovelSearchResponse(query=query, novels=novels)
+
+
+@app.post("/search/sources")
+def search_download_sources(request: SourceSearchRequest) -> SourceSearchResponse:
+    title = normalize_search_text(request.title, "小说名称")
+    results = unique_search_results(
+        web_search(f'"{title}"', relevance_query=title)
+        + web_search(f'"{title}" 小说 目录 在线阅读', relevance_query=title)
+    )
+    sources: list[DownloadSource] = []
+    seen_hosts: set[str] = set()
+    session = build_session()
+
+    for _, result_url, description in results[:MAX_SOURCE_CHECKS]:
+        host = (urlparse(result_url).hostname or "").lower()
+        if not host or host in seen_hosts or is_non_download_source(host) or is_search_result_url(result_url):
+            continue
+        try:
+            response = fetch(session, result_url, raise_for_status=False)
+            if response.status_code != 200 or "text/html" not in response.headers.get("content-type", ""):
+                continue
+            soup = clean_soup(response.text)
+            page_title = extract_title(response.url, soup)
+            if fuzzy_match_score(title, page_title) < 35:
+                continue
+            root_host = urlparse(response.url).netloc
+            links = extract_strong_chapter_links(response.url, soup, root_host)
+            start_url = find_start_chapter_url(response.url, soup, root_host)
+            catalog_url = extract_catalog_url(response.url, soup, root_host)
+            if not catalog_url and len(links) < 2:
+                continue
+            page_text = " ".join(soup.get_text(" ").split())
+            metadata_signals = sum(1 for signal in ("作者", "小说", "章节", "目录", "最新章节") if signal in page_text)
+            if metadata_signals < 2:
+                continue
+            sources.append(DownloadSource(
+                siteName=display_host(host),
+                url=response.url,
+                description=description[:240],
+                chapterHints=max(len(links), 1 if start_url or catalog_url else 0),
+            ))
+            seen_hosts.add(host)
+        except (HTTPException, requests.RequestException):
+            continue
+        except Exception:
+            continue
+
+    return SourceSearchResponse(title=title, sources=sources)
+
+
+@app.post("/chapters")
+def scan_chapter_list(request: ChapterListRequest) -> ChapterListResponse:
+    source_url = str(request.url)
+    if is_search_result_url(source_url):
+        raise HTTPException(status_code=422, detail="所选地址是搜索/查询页面，不是稳定的小说详情页")
+    session = build_session()
+    page = fetch(session, source_url, raise_for_status=False)
+    if page.status_code != 200 or "text/html" not in page.headers.get("content-type", ""):
+        raise HTTPException(status_code=422, detail="无法读取该网站的小说详情页")
+    soup = clean_soup(page.text)
+    root_host = urlparse(page.url).netloc
+    chapters = extract_chapter_entries(page.url, soup, root_host)
+
+    catalog_url = extract_catalog_url(page.url, soup, root_host)
+    if catalog_url:
+        try:
+            catalog_page = fetch(session, catalog_url)
+            catalog_soup = clean_soup(catalog_page.text)
+            catalog_entries = extract_chapter_entries(catalog_page.url, catalog_soup, root_host)
+            if len(catalog_entries) > len(chapters):
+                chapters = catalog_entries
+        except (HTTPException, requests.RequestException):
+            pass
+
+    if not chapters:
+        raise HTTPException(status_code=422, detail="未能扫描到可选择的章节目录，请更换下载网站")
+    title = request.title or extract_title(page.url, soup)
+    return ChapterListResponse(title=title, sourceUrl=page.url, chapters=chapters[:MAX_CHAPTER_LIST_SIZE])
 
 
 @app.post("/index")
@@ -333,6 +499,8 @@ def index_site(request: CrawlRequest) -> CrawlResponse:
 
 @app.post("/download")
 def download_novel(request: DownloadRequest) -> DownloadResponse:
+    if is_search_result_url(str(request.url)):
+        raise HTTPException(status_code=422, detail="所选地址是搜索/查询页面，不是稳定的小说详情页，请返回并选择其他网站")
     session = build_session()
     page = fetch(session, str(request.url), raise_for_status=False)
     login_form = find_login_form(page.url, page.text)
@@ -347,6 +515,19 @@ def download_novel(request: DownloadRequest) -> DownloadResponse:
     title = request.title or extract_title(page.url, soup)
     root_host = urlparse(str(request.url)).netloc
     chapters: list[tuple[str, str]] = []
+
+    if request.chapterUrls is not None:
+        selected_urls = validate_selected_chapter_urls(str(request.url), request.chapterUrls)
+        chapters = download_selected_chapters(session, selected_urls, root_host, str(request.url))
+        validate_download_completeness(len(chapters), len(selected_urls))
+        content = format_txt(title, chapters)
+        return DownloadResponse(
+            title=title,
+            filename=safe_filename(title) + ".txt",
+            content=content,
+            chapterCount=len(selected_urls),
+        )
+
     start_chapter_url = find_start_chapter_url(page.url, soup, root_host)
     
     if not start_chapter_url:
@@ -376,8 +557,8 @@ def download_novel(request: DownloadRequest) -> DownloadResponse:
             seen_urls.add(current_url)
             try:
                 chapter_page = fetch(session, current_url, referer=str(request.url))
-            except requests.RequestException:
-                break
+            except requests.RequestException as error:
+                raise HTTPException(status_code=502, detail="章节抓取中断，已停止生成不完整 TXT，请稍后重试") from error
                 
             if is_chapter_blocked(chapter_page):
                 raise HTTPException(
@@ -401,6 +582,8 @@ def download_novel(request: DownloadRequest) -> DownloadResponse:
     if not chapters:
         raise HTTPException(status_code=422, detail="未能提取到有效章节正文：当前页面更像目录/详情页，或章节正文被站点验证拦截")
 
+    validate_download_completeness(len(chapters), request.expectedChapterCount)
+
     content = format_txt(title, chapters)
     return DownloadResponse(
         title=title,
@@ -410,9 +593,251 @@ def download_novel(request: DownloadRequest) -> DownloadResponse:
     )
 
 
+def normalize_search_text(value: str, field_name: str) -> str:
+    text = " ".join(value.split()).strip()
+    if not text:
+        raise HTTPException(status_code=422, detail=f"请输入{field_name}")
+    if len(text) > 80:
+        raise HTTPException(status_code=422, detail=f"{field_name}不能超过 80 个字符")
+    return text
+
+
+def web_search(query: str, relevance_query: Optional[str] = None) -> list[tuple[str, str, str]]:
+    bing_error: Optional[HTTPException] = None
+    try:
+        results = bing_rss_search(query)
+        if results and (not relevance_query or search_results_are_relevant(results, relevance_query)):
+            return results
+    except HTTPException as error:
+        bing_error = error
+
+    try:
+        return duckduckgo_html_search(query)
+    except HTTPException as error:
+        bing_detail = f"；Bing：{bing_error.detail}" if bing_error else "；Bing 未返回结果"
+        raise HTTPException(
+            status_code=502,
+            detail=f"搜索服务暂时不可用{bing_detail}；DuckDuckGo：{error.detail}",
+        ) from error
+
+
+def search_results_are_relevant(results: list[tuple[str, str, str]], query: str) -> bool:
+    return any(
+        fuzzy_match_score(query, extract_search_novel_title(result_title, query)) >= 55
+        for result_title, _, _ in results
+    )
+
+
+def bing_rss_search(query: str) -> list[tuple[str, str, str]]:
+    endpoint = os.getenv("NOVEL_SEARCH_RSS_URL", "https://www.bing.com/search?format=rss&q={query}")
+    if "{query}" not in endpoint:
+        raise HTTPException(status_code=500, detail="NOVEL_SEARCH_RSS_URL 必须包含 {query} 占位符")
+    search_url = endpoint.replace("{query}", quote_plus(query))
+    response = request_search_provider(search_url, "Bing")
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as error:
+        raise HTTPException(status_code=502, detail="返回了无法识别的 RSS 数据") from error
+
+    results: list[tuple[str, str, str]] = []
+    for item in root.findall(".//item"):
+        title = " ".join((item.findtext("title") or "").split())
+        url = (item.findtext("link") or "").strip()
+        description_html = item.findtext("description") or ""
+        description_text = BeautifulSoup(description_html, "html.parser").get_text(" ") if "<" in description_html else description_html
+        description = " ".join(description_text.split())
+        parsed = urlparse(url)
+        if title and parsed.scheme in ("http", "https") and parsed.hostname:
+            results.append((title, url, description))
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+    return results
+
+
+def duckduckgo_html_search(query: str) -> list[tuple[str, str, str]]:
+    endpoint = os.getenv("DUCKDUCKGO_HTML_URL", "https://lite.duckduckgo.com/lite/?q={query}")
+    if "{query}" not in endpoint:
+        raise HTTPException(status_code=500, detail="DUCKDUCKGO_HTML_URL 必须包含 {query} 占位符")
+    response_url, response_html = request_duckduckgo_provider(endpoint.replace("{query}", quote_plus(query)))
+    soup = BeautifulSoup(response_html, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    for link in soup.select("a.result__a[href], a.result-link[href]"):
+        title = " ".join(link.get_text(" ").split())
+        url = extract_duckduckgo_target(urljoin(response_url, link.get("href") or ""))
+        snippet = link.find_next(class_=["result__snippet", "result-snippet"])
+        description = " ".join(snippet.get_text(" ").split()) if snippet else ""
+        parsed = urlparse(url)
+        if title and parsed.scheme in ("http", "https") and parsed.hostname:
+            results.append((title, url, description))
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+    return results
+
+
+class NoSearchRedirect(urllib_request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def request_duckduckgo_provider(search_url: str) -> tuple[str, str]:
+    proxy = proxy_manager.get_proxy(force_rotate=False) or {}
+    proxy_handler = urllib_request.ProxyHandler(proxy) if proxy else urllib_request.ProxyHandler()
+    opener = urllib_request.build_opener(proxy_handler, NoSearchRedirect())
+    current_url = search_url
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
+    for _ in range(MAX_REDIRECTS + 1):
+        validate_fetch_url(current_url)
+        request = urllib_request.Request(current_url, headers={"User-Agent": user_agent, "Accept-Language": "zh-CN,zh;q=0.9"})
+        try:
+            response = opener.open(request, timeout=TIMEOUT_SECONDS)
+        except urllib_error.HTTPError as error:
+            if error.code in (301, 302, 303, 307, 308) and error.headers.get("Location"):
+                current_url = urljoin(current_url, error.headers["Location"])
+                continue
+            raise HTTPException(status_code=502, detail=f"返回 HTTP {error.code}") from error
+        except Exception as error:
+            raise HTTPException(status_code=502, detail="请求失败") from error
+
+        content = response.read(2_000_001)
+        if len(content) > 2_000_000:
+            raise HTTPException(status_code=502, detail="返回数据过大")
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.geturl(), content.decode(charset, errors="replace")
+    raise HTTPException(status_code=502, detail="重定向次数过多")
+
+
+def extract_duckduckgo_target(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.hostname and (parsed.hostname == "duckduckgo.com" or parsed.hostname.endswith(".duckduckgo.com")):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            return unquote(target)
+    return url
+
+
+def request_search_provider(search_url: str, provider_name: str) -> requests.Response:
+    session = build_session()
+    try:
+        response = None
+        current_url = search_url
+        for _ in range(MAX_REDIRECTS + 1):
+            validate_fetch_url(current_url)
+            response = session.get(
+                current_url,
+                timeout=TIMEOUT_SECONDS,
+                allow_redirects=False,
+                proxies=proxy_manager.get_proxy(force_rotate=False),
+            )
+            if not response.is_redirect:
+                break
+            location = response.headers.get("location")
+            if not location:
+                break
+            current_url = urljoin(response.url, location)
+        if response is None or response.is_redirect:
+            raise ValueError("搜索服务重定向次数过多")
+        response.encoding = response.apparent_encoding or response.encoding
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"{provider_name} 请求失败") from error
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"返回 HTTP {response.status_code}")
+    return response
+
+
+def extract_search_novel_title(result_title: str, query: str) -> str:
+    title = re.sub(r"^[《\u300c\u300e](.*?)[》\u300d\u300f].*$", r"\1", result_title).strip()
+    if title == result_title.strip():
+        title = re.split(
+            r"\s*[（(]\s*|\s*[-_|｜—]\s*|(?:最新章节|全文阅读|免费阅读|小说在线阅读|章节列表|百度百科|起点中文网).*$",
+            title,
+            maxsplit=1,
+        )[0].strip(" 《》\u300c\u300d\u300e\u300f")
+    if not title or len(title) > 60:
+        return query
+    title = title.strip(" \t\r\n，。！？、,.!?：:；;《》\u300c\u300d\u300e\u300f")
+    if title.startswith(query):
+        suffix = title[len(query):].lstrip()
+        if re.match(r"(?:小说|在线|全文|免费|无删减|txt|阅读|最新)", suffix, flags=re.IGNORECASE):
+            return query
+    return title
+
+
+def normalize_title_key(title: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", title.lower())
+
+
+def fuzzy_match_score(query: str, candidate: str) -> int:
+    query_key = normalize_title_key(query)
+    candidate_key = normalize_title_key(candidate)
+    if not query_key or not candidate_key:
+        return 0
+    if query_key == candidate_key:
+        return 100
+    if query_key in candidate_key:
+        return max(70, round(len(query_key) / len(candidate_key) * 100))
+    if candidate_key in query_key:
+        return round(len(candidate_key) / len(query_key) * 100)
+    return round(SequenceMatcher(None, query_key, candidate_key).ratio() * 100)
+
+
+def is_non_download_source(host: str) -> bool:
+    blocked = (
+        "bing.com", "baidu.com", "baike.baidu.com", "zhihu.com", "douban.com",
+        "wikipedia.org", "weibo.com", "bilibili.com", "tieba.baidu.com", "cctv.com",
+        "qq.com", "iqiyi.com", "youku.com",
+    )
+    return any(host == domain or host.endswith(f".{domain}") for domain in blocked)
+
+
+def is_search_result_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(segment in ("search", "query", "bookquery") for segment in path.split("/") if segment)
+
+
+def validate_download_completeness(chapter_count: int, expected_chapter_count: Optional[int]) -> None:
+    if not expected_chapter_count or expected_chapter_count < 2:
+        return
+    minimum_acceptable = max(2, (expected_chapter_count * 9 + 9) // 10)
+    if chapter_count < minimum_acceptable:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"检测到下载不完整：来源页至少发现 {expected_chapter_count} 个章节入口，"
+                f"实际只提取到 {chapter_count} 章。已停止生成残缺 TXT，请选择其他网站。"
+            ),
+        )
+
+
+def display_host(host: str) -> str:
+    return host[4:] if host.startswith("www.") else host
+
+
+def unique_search_results(results: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    unique: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for item in results:
+        url = normalize_url(item[1])
+        if url not in seen:
+            unique.append((item[0], url, item[2]))
+            seen.add(url)
+    return unique
+
+
+def extract_strong_chapter_links(page_url: str, soup: BeautifulSoup, root_host: str) -> list[str]:
+    links: list[str] = []
+    for tag in soup.find_all("a", href=True):
+        text = " ".join(tag.get_text(" ").split())
+        href = normalize_url(urljoin(page_url, tag["href"]))
+        if urlparse(href).netloc != root_host or is_catalog_link(text, href):
+            continue
+        if score_chapter_anchor(text, href) >= 5:
+            links.append(href)
+    return unique_urls(links)
+
+
 def build_session() -> requests.Session:
     # 随机选择浏览器类型和版本指纹以应对更严格的风控
-    impersonate_targets = ["chrome", "edge", "safari", "chrome110", "edge101", "safari15.5"]
+    impersonate_targets = ["chrome", "edge", "safari", "chrome110", "edge101"]
     selected_impersonate = random.choice(impersonate_targets)
     session = Session(impersonate=selected_impersonate)
     session.headers.update({
@@ -730,6 +1155,59 @@ def extract_internal_links(page_url: str, soup: BeautifulSoup, root_host: str) -
     return list(dict.fromkeys(links))
 
 
+def validate_selected_chapter_urls(base_url: str, chapter_urls: list[HttpUrl]) -> list[str]:
+    if not chapter_urls:
+        raise HTTPException(status_code=422, detail="请至少选择一个章节")
+    if len(chapter_urls) > MAX_CHAPTER_LIST_SIZE:
+        raise HTTPException(status_code=422, detail=f"单次最多选择 {MAX_CHAPTER_LIST_SIZE} 个章节")
+    root_host = urlparse(base_url).netloc
+    selected: list[str] = []
+    for value in chapter_urls:
+        url = normalize_url(str(value))
+        if urlparse(url).netloc != root_host:
+            raise HTTPException(status_code=400, detail="所选章节必须与小说来源属于同一网站")
+        if url not in selected:
+            selected.append(url)
+    return selected
+
+
+def download_selected_chapters(
+    session: requests.Session,
+    chapter_urls: list[str],
+    root_host: str,
+    referer: str,
+) -> list[tuple[str, str]]:
+    chapters: list[tuple[str, str]] = []
+    failed_titles: list[str] = []
+    for chapter_url in chapter_urls:
+        current_url: Optional[str] = chapter_url
+        seen_pages: set[str] = set()
+        page_texts: list[str] = []
+        chapter_title = ""
+        while current_url and current_url not in seen_pages and len(seen_pages) < MAX_CHAPTER_PAGES:
+            seen_pages.add(current_url)
+            chapter_page = fetch(session, current_url, referer=referer)
+            if is_chapter_blocked(chapter_page):
+                raise HTTPException(status_code=403, detail=f"章节页触发验证码/人工验证：{chapter_page.url}")
+            chapter_soup = clean_soup(chapter_page.text)
+            if not chapter_title:
+                chapter_title = extract_title(chapter_page.url, chapter_soup)
+            page_text = extract_main_text(chapter_soup)
+            if is_valid_chapter_text(chapter_title, page_text):
+                page_texts.append(page_text)
+            current_url = find_next_content_page_url(chapter_page.url, chapter_soup, root_host)
+
+        if page_texts:
+            chapters.append((chapter_title or chapter_url, "\n".join(page_texts)))
+        else:
+            failed_titles.append(chapter_title or chapter_url)
+
+    if failed_titles:
+        preview = "、".join(failed_titles[:3])
+        raise HTTPException(status_code=422, detail=f"有 {len(failed_titles)} 个所选章节未提取到正文：{preview}")
+    return chapters
+
+
 def unique_urls(urls: list[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -773,6 +1251,18 @@ def find_next_page_url(page_url: str, soup: BeautifulSoup, root_host: str) -> Op
     return None
 
 
+def find_next_content_page_url(page_url: str, soup: BeautifulSoup, root_host: str) -> Optional[str]:
+    for tag in soup.find_all("a", href=True):
+        text = " ".join(tag.get_text(" ").split())
+        if "下一页" not in text or "下一章" in text or any(word in text for word in ("目录", "末页", "尾页")):
+            continue
+        href = normalize_url(urljoin(page_url, tag["href"]))
+        parsed = urlparse(href)
+        if parsed.scheme in ("http", "https") and parsed.netloc == root_host:
+            return href
+    return None
+
+
 def extract_catalog_url(page_url: str, soup: BeautifulSoup, root_host: str) -> Optional[str]:
     for tag in soup.find_all("a", href=True):
         text = " ".join(tag.get_text(" ").split())
@@ -812,6 +1302,67 @@ def extract_chapter_links(page_url: str, soup: BeautifulSoup, root_host: str) ->
             scored.append((score * 10000 - index, href))
     scored.sort(key=lambda item: item[0], reverse=True)
     return unique_urls([url for _, url in scored])
+
+
+def extract_chapter_entries(page_url: str, soup: BeautifulSoup, root_host: str) -> list[ChapterEntry]:
+    scoped_tags = []
+    for selector in (
+        ".mulu_list a[href]", ".chapter-list a[href]", ".chapters a[href]", ".catalog a[href]",
+        ".listmain a[href]", "#list a[href]", ".book_list a[href]", "dl a[href]",
+    ):
+        scoped_tags.extend(soup.select(selector))
+    tags = scoped_tags or soup.find_all("a", href=True)
+    entries: list[tuple[int, ChapterEntry, Optional[int]]] = []
+    seen: set[str] = set()
+    for index, tag in enumerate(tags):
+        title = " ".join(tag.get_text(" ").split()).strip()
+        href = normalize_url(urljoin(page_url, tag.get("href") or ""))
+        parsed = urlparse(href)
+        if not title or len(title) > 120 or parsed.netloc != root_host or href in seen:
+            continue
+        if is_catalog_link(title, href) or not is_chapter_list_title(title):
+            continue
+        seen.add(href)
+        entries.append((index, ChapterEntry(title=title, url=href), extract_chapter_order(title)))
+        if len(entries) >= MAX_CHAPTER_LIST_SIZE:
+            break
+
+    numbered_count = sum(1 for _, _, order in entries if order is not None)
+    if entries and numbered_count >= max(2, len(entries) * 3 // 5):
+        entries.sort(key=lambda item: (item[2] is None, item[2] if item[2] is not None else item[0], item[0]))
+    return [entry for _, entry, _ in entries]
+
+
+def is_chapter_list_title(title: str) -> bool:
+    if any(word in title for word in ("上一章", "下一章", "上一页", "下一页", "开始阅读", "免费阅读")):
+        return False
+    return is_probable_chapter_title(title) or title.strip() in ("楔子", "序章", "前言") or title.strip().startswith("番外")
+
+
+def extract_chapter_order(title: str) -> Optional[int]:
+    match = re.search(r"第\s*([0-9零〇一二两三四五六七八九十百千万]+)\s*[章节回卷]", title)
+    if not match:
+        return 0 if title.strip() in ("楔子", "序章", "前言") else None
+    value = match.group(1)
+    if value.isdigit():
+        return int(value)
+    return chinese_number_to_int(value)
+
+
+def chinese_number_to_int(value: str) -> Optional[int]:
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+    total = 0
+    current = 0
+    for char in value:
+        if char in digits:
+            current = digits[char]
+        elif char in units:
+            total += (current or 1) * units[char]
+            current = 0
+        else:
+            return None
+    return total + current
 
 
 def is_catalog_link(text: str, href: str) -> bool:
@@ -878,7 +1429,7 @@ def is_probable_chapter_url(url: str) -> bool:
 
 
 def is_probable_chapter_title(title: str) -> bool:
-    return bool(re.search(r"第\s*[0-9一二三四五六七八九十百千万]+\s*[章节回卷]", title))
+    return bool(re.search(r"第\s*[0-9零〇一二两三四五六七八九十百千万]+\s*[章节回卷]", title))
 
 
 def is_non_novel_url(url: str, title: str) -> bool:

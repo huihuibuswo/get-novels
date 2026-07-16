@@ -30,6 +30,34 @@ type DownloadResult = {
   chapterCount: number;
 };
 
+type WebNovelCandidate = {
+  title: string;
+  description: string;
+  matchScore: number;
+  sourceCount: number;
+};
+
+export type DownloadSource = {
+  siteName: string;
+  url: string;
+  description: string;
+  chapterHints: number;
+};
+
+export type ChapterEntry = {
+  title: string;
+  url: string;
+};
+
+type ChapterListResult = {
+  title: string;
+  sourceUrl: string;
+  chapters: ChapterEntry[];
+};
+
+type NovelSearchResult = { query: string; novels: WebNovelCandidate[] };
+type SourceSearchResult = { title: string; sources: DownloadSource[] };
+
 type CrawlCredentials = {
   username: string;
   password: string;
@@ -42,11 +70,16 @@ type CrawlerStore = {
   search: string;
   activeCategory: string;
   loading: boolean;
+  loadingAction: 'site' | 'novels' | 'sources' | 'chapters' | '';
   downloadingUrl: string;
   error: string;
   captchaUrl: string;
   showLogin: boolean;
   result: IndexResult | null;
+  novelSearchResult: NovelSearchResult | null;
+  sourceSearchResult: SourceSearchResult | null;
+  chapterListResult: ChapterListResult | null;
+  chapterSource: DownloadSource | null;
   downloadResult: DownloadResult | null;
   setUrl: (url: string) => void;
   setUsername: (username: string) => void;
@@ -56,7 +89,13 @@ type CrawlerStore = {
   setShowLogin: (showLogin: boolean) => void;
   clearCaptcha: () => void;
   indexSite: (credentials?: CrawlCredentials) => Promise<void>;
-  downloadNovel: (novel: NovelCandidate) => Promise<void>;
+  searchNovels: () => Promise<void>;
+  searchSources: (title: string) => Promise<void>;
+  closeSources: () => void;
+  scanChapters: (source: DownloadSource, title: string) => Promise<void>;
+  closeChapterPicker: () => void;
+  downloadNovel: (novel: NovelCandidate, expectedChapterCount?: number, chapterUrls?: string[]) => Promise<void>;
+  downloadChapters: (source: DownloadSource, title: string, chapters: ChapterEntry[]) => Promise<void>;
   clearDownload: () => void;
 };
 
@@ -67,11 +106,16 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
   search: '',
   activeCategory: '全部',
   loading: false,
+  loadingAction: '',
   downloadingUrl: '',
   error: '',
   captchaUrl: '',
   showLogin: false,
   result: null,
+  novelSearchResult: null,
+  sourceSearchResult: null,
+  chapterListResult: null,
+  chapterSource: null,
   downloadResult: null,
   setUrl: (url) => set({ url }),
   setUsername: (username) => set({ username }),
@@ -87,7 +131,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       return;
     }
 
-    set({ loading: true, error: '', downloadResult: null });
+    set({ loading: true, loadingAction: 'site', error: '', downloadResult: null, novelSearchResult: null, sourceSearchResult: null, chapterListResult: null, chapterSource: null });
     try {
       const response = await fetch(`${API_BASE_URL || '/api'}/index`, {
         method: 'POST',
@@ -96,7 +140,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       });
 
       if (!response.ok) {
-        throw new Error(await response.text());
+        throw new Error(await readApiError(response));
       }
 
       const result = (await response.json()) as IndexResult;
@@ -104,16 +148,67 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
         result,
         showLogin: result.requiresLogin,
         loading: false,
+        loadingAction: '',
         password: result.requiresLogin ? get().password : '',
       });
     } catch (error) {
       set({
         loading: false,
+        loadingAction: '',
         error: error instanceof Error ? error.message : '抓取失败',
       });
     }
   },
-  downloadNovel: async (novel) => {
+  searchNovels: async () => {
+    const query = get().url.trim();
+    if (!query) {
+      set({ error: '请输入小说名称' });
+      return;
+    }
+    set({ loading: true, loadingAction: 'novels', error: '', result: null, novelSearchResult: null, sourceSearchResult: null, chapterListResult: null, chapterSource: null, downloadResult: null });
+    try {
+      const response = await fetch(`${API_BASE_URL || '/api'}/search/novels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response));
+      set({ novelSearchResult: (await response.json()) as NovelSearchResult, loading: false, loadingAction: '' });
+    } catch (error) {
+      set({ loading: false, loadingAction: '', error: error instanceof Error ? error.message : '全网搜索失败' });
+    }
+  },
+  searchSources: async (title) => {
+    set({ loading: true, loadingAction: 'sources', error: '', sourceSearchResult: null });
+    try {
+      const response = await fetch(`${API_BASE_URL || '/api'}/search/sources`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response));
+      set({ sourceSearchResult: (await response.json()) as SourceSearchResult, loading: false, loadingAction: '' });
+    } catch (error) {
+      set({ loading: false, loadingAction: '', error: error instanceof Error ? error.message : '下载网站搜索失败' });
+    }
+  },
+  closeSources: () => set({ sourceSearchResult: null }),
+  scanChapters: async (source, title) => {
+    set({ loading: true, loadingAction: 'chapters', error: '', chapterListResult: null, chapterSource: source });
+    try {
+      const response = await fetch(`${API_BASE_URL || '/api'}/chapters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: source.url, title }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response));
+      set({ chapterListResult: (await response.json()) as ChapterListResult, loading: false, loadingAction: '' });
+    } catch (error) {
+      set({ loading: false, loadingAction: '', chapterSource: null, error: error instanceof Error ? error.message : '章节目录扫描失败' });
+    }
+  },
+  closeChapterPicker: () => set({ chapterListResult: null, chapterSource: null }),
+  downloadNovel: async (novel, expectedChapterCount, chapterUrls?: string[]) => {
     const { username, password, showLogin } = get();
     set({ downloadingUrl: novel.url, error: '', captchaUrl: '', downloadResult: null });
     try {
@@ -123,12 +218,14 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
         body: JSON.stringify({
           url: novel.url,
           title: novel.title,
+          expectedChapterCount,
+          chapterUrls,
           credentials: showLogin ? { username, password } : undefined,
         }),
       });
 
       if (!response.ok) {
-        const text = await response.text();
+        const text = await readApiError(response);
         const captchaUrl = text.match(/https?:\/\/[^\s"'}]+captcha[^\s"'}]*/i)?.[0] ?? '';
         set({ captchaUrl });
         throw new Error(text);
@@ -142,7 +239,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       anchor.download = downloadResult.filename;
       anchor.click();
       URL.revokeObjectURL(href);
-      set({ downloadResult, downloadingUrl: '' });
+      set({ downloadResult, downloadingUrl: '', sourceSearchResult: null, chapterListResult: null, chapterSource: null });
     } catch (error) {
       set({
         downloadingUrl: '',
@@ -150,5 +247,30 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       });
     }
   },
+  downloadChapters: async (source, title, chapters) => {
+    const novel: NovelCandidate = {
+      title,
+      url: source.url,
+      category: '全网搜索',
+      tags: [],
+      description: source.description,
+      score: 0,
+      matchedKeywords: [],
+      wordCount: 0,
+      textLength: 0,
+      chapterHints: source.chapterHints,
+    };
+    await get().downloadNovel(novel, chapters.length, chapters.map((chapter) => chapter.url));
+  },
   clearDownload: () => set({ downloadResult: null }),
 }));
+
+async function readApiError(response: Response) {
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text) as { detail?: string };
+    return parsed.detail || text;
+  } catch {
+    return text;
+  }
+}
