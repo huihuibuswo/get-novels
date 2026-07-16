@@ -26,6 +26,8 @@ npm run dev
 
 然后打开 `http://localhost:5173`。
 
+当前测试站：`https://get-novels.pages.dev`
+
 ## 当前边界
 
 - 只做同域名、限量页面扫描和限量章节抓取，避免无限爬取。
