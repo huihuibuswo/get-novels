@@ -37,11 +37,22 @@ type WebNovelCandidate = {
   sourceCount: number;
 };
 
-type DownloadSource = {
+export type DownloadSource = {
   siteName: string;
   url: string;
   description: string;
   chapterHints: number;
+};
+
+export type ChapterEntry = {
+  title: string;
+  url: string;
+};
+
+type ChapterListResult = {
+  title: string;
+  sourceUrl: string;
+  chapters: ChapterEntry[];
 };
 
 type NovelSearchResult = { query: string; novels: WebNovelCandidate[] };
@@ -59,7 +70,7 @@ type CrawlerStore = {
   search: string;
   activeCategory: string;
   loading: boolean;
-  loadingAction: 'site' | 'novels' | 'sources' | '';
+  loadingAction: 'site' | 'novels' | 'sources' | 'chapters' | '';
   downloadingUrl: string;
   error: string;
   captchaUrl: string;
@@ -67,6 +78,8 @@ type CrawlerStore = {
   result: IndexResult | null;
   novelSearchResult: NovelSearchResult | null;
   sourceSearchResult: SourceSearchResult | null;
+  chapterListResult: ChapterListResult | null;
+  chapterSource: DownloadSource | null;
   downloadResult: DownloadResult | null;
   setUrl: (url: string) => void;
   setUsername: (username: string) => void;
@@ -79,8 +92,10 @@ type CrawlerStore = {
   searchNovels: () => Promise<void>;
   searchSources: (title: string) => Promise<void>;
   closeSources: () => void;
-  downloadNovel: (novel: NovelCandidate) => Promise<void>;
-  downloadSource: (source: DownloadSource, title: string) => Promise<void>;
+  scanChapters: (source: DownloadSource, title: string) => Promise<void>;
+  closeChapterPicker: () => void;
+  downloadNovel: (novel: NovelCandidate, expectedChapterCount?: number, chapterUrls?: string[]) => Promise<void>;
+  downloadChapters: (source: DownloadSource, title: string, chapters: ChapterEntry[]) => Promise<void>;
   clearDownload: () => void;
 };
 
@@ -99,6 +114,8 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
   result: null,
   novelSearchResult: null,
   sourceSearchResult: null,
+  chapterListResult: null,
+  chapterSource: null,
   downloadResult: null,
   setUrl: (url) => set({ url }),
   setUsername: (username) => set({ username }),
@@ -114,7 +131,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       return;
     }
 
-    set({ loading: true, loadingAction: 'site', error: '', downloadResult: null, novelSearchResult: null, sourceSearchResult: null });
+    set({ loading: true, loadingAction: 'site', error: '', downloadResult: null, novelSearchResult: null, sourceSearchResult: null, chapterListResult: null, chapterSource: null });
     try {
       const response = await fetch(`${API_BASE_URL || '/api'}/index`, {
         method: 'POST',
@@ -148,7 +165,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       set({ error: '请输入小说名称' });
       return;
     }
-    set({ loading: true, loadingAction: 'novels', error: '', result: null, novelSearchResult: null, sourceSearchResult: null, downloadResult: null });
+    set({ loading: true, loadingAction: 'novels', error: '', result: null, novelSearchResult: null, sourceSearchResult: null, chapterListResult: null, chapterSource: null, downloadResult: null });
     try {
       const response = await fetch(`${API_BASE_URL || '/api'}/search/novels`, {
         method: 'POST',
@@ -176,7 +193,22 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
     }
   },
   closeSources: () => set({ sourceSearchResult: null }),
-  downloadNovel: async (novel) => {
+  scanChapters: async (source, title) => {
+    set({ loading: true, loadingAction: 'chapters', error: '', chapterListResult: null, chapterSource: source });
+    try {
+      const response = await fetch(`${API_BASE_URL || '/api'}/chapters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: source.url, title }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response));
+      set({ chapterListResult: (await response.json()) as ChapterListResult, loading: false, loadingAction: '' });
+    } catch (error) {
+      set({ loading: false, loadingAction: '', chapterSource: null, error: error instanceof Error ? error.message : '章节目录扫描失败' });
+    }
+  },
+  closeChapterPicker: () => set({ chapterListResult: null, chapterSource: null }),
+  downloadNovel: async (novel, expectedChapterCount, chapterUrls?: string[]) => {
     const { username, password, showLogin } = get();
     set({ downloadingUrl: novel.url, error: '', captchaUrl: '', downloadResult: null });
     try {
@@ -186,6 +218,8 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
         body: JSON.stringify({
           url: novel.url,
           title: novel.title,
+          expectedChapterCount,
+          chapterUrls,
           credentials: showLogin ? { username, password } : undefined,
         }),
       });
@@ -205,7 +239,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       anchor.download = downloadResult.filename;
       anchor.click();
       URL.revokeObjectURL(href);
-      set({ downloadResult, downloadingUrl: '', sourceSearchResult: null });
+      set({ downloadResult, downloadingUrl: '', sourceSearchResult: null, chapterListResult: null, chapterSource: null });
     } catch (error) {
       set({
         downloadingUrl: '',
@@ -213,7 +247,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       });
     }
   },
-  downloadSource: async (source, title) => {
+  downloadChapters: async (source, title, chapters) => {
     const novel: NovelCandidate = {
       title,
       url: source.url,
@@ -226,7 +260,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       textLength: 0,
       chapterHints: source.chapterHints,
     };
-    await get().downloadNovel(novel);
+    await get().downloadNovel(novel, chapters.length, chapters.map((chapter) => chapter.url));
   },
   clearDownload: () => set({ downloadResult: null }),
 }));

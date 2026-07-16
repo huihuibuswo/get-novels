@@ -30,7 +30,7 @@ function ShootingStars() {
   );
 }
 
-type ProgressMode = 'site' | 'novels' | 'sources' | 'download';
+type ProgressMode = 'site' | 'novels' | 'sources' | 'chapters' | 'download';
 
 function CrawlProgress({ active, mode }: { active: boolean; mode: ProgressMode }) {
   const [progress, setProgress] = React.useState(0);
@@ -72,13 +72,15 @@ function CrawlProgress({ active, mode }: { active: boolean; mode: ProgressMode }
         ? '正在全网模糊匹配小说...'
         : mode === 'sources'
           ? '正在验证可下载网站...'
+          : mode === 'chapters'
+            ? '正在扫描章节目录...'
           : progress < 45
             ? '正在定位章节目录...'
             : '正在格式化 TXT 文件...'
     : '处理完成';
 
   return (
-    <div className="fixed left-0 right-0 top-0 z-50 border-b border-cyan-300/10 bg-[#07090f]/80 px-4 py-3 shadow-[0_0_30px_rgba(34,211,238,0.18)] backdrop-blur-xl">
+    <div className="pointer-events-none fixed left-0 right-0 top-0 z-[9999] border-b border-cyan-300/10 bg-[#07090f]/80 px-4 py-3 shadow-[0_0_30px_rgba(34,211,238,0.18)] backdrop-blur-xl">
       <div className="mx-auto flex max-w-6xl flex-col gap-2">
         <div className="flex items-center justify-between text-xs text-slate-300">
           <span className="tracking-[0.28em] text-cyan-200">{status}</span>
@@ -114,6 +116,8 @@ function App() {
     result,
     novelSearchResult,
     sourceSearchResult,
+    chapterListResult,
+    chapterSource,
     downloadResult,
     showLogin,
     setUrl,
@@ -127,8 +131,9 @@ function App() {
     searchNovels,
     searchSources,
     closeSources,
-    downloadNovel,
-    downloadSource,
+    scanChapters,
+    closeChapterPicker,
+    downloadChapters,
     clearDownload,
   } = useCrawlerStore();
 
@@ -168,6 +173,13 @@ function App() {
   // 4. 无限滚动分段渲染控制
   const [visibleCount, setVisibleCount] = React.useState(10);
   const sentinelRef = React.useRef<HTMLDivElement>(null);
+  const [chapterMode, setChapterMode] = React.useState<'all' | 'partial'>('all');
+  const [selectedChapterUrls, setSelectedChapterUrls] = React.useState<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    setChapterMode('all');
+    setSelectedChapterUrls(new Set(chapterListResult?.chapters.map((chapter) => chapter.url) ?? []));
+  }, [chapterListResult]);
 
   // 切换筛选、搜索、抓取结果时重置可见数量
   React.useEffect(() => {
@@ -381,10 +393,15 @@ function App() {
                       <button
                         className="shrink-0 rounded-2xl border border-emerald-300/30 bg-emerald-300/90 px-5 py-3 font-bold text-slate-950 shadow-[0_0_22px_rgba(52,211,153,0.24)] transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:opacity-60"
                         type="button"
-                        disabled={Boolean(downloadingUrl)}
-                        onClick={() => void downloadNovel(novel)}
+                        disabled={loading || Boolean(downloadingUrl)}
+                        onClick={() => void scanChapters({
+                          siteName: new URL(novel.url).hostname,
+                          url: novel.url,
+                          description: novel.description,
+                          chapterHints: novel.chapterHints,
+                        }, novel.title)}
                       >
-                        {downloadingUrl === novel.url ? '生成中…' : '爬取并下载'}
+                        {loading && chapterSource?.url === novel.url ? '扫描章节中…' : '扫描章节并下载'}
                       </button>
                     </div>
                     <p className="mt-2 text-xs text-slate-500 font-mono">{novel.url}</p>
@@ -445,7 +462,7 @@ function App() {
           <section className="mt-6 rounded-3xl border border-emerald-300/20 bg-emerald-400/10 p-5 shadow-[0_0_28px_rgba(52,211,153,0.14)] backdrop-blur">
             <div className="flex flex-col justify-between gap-3 md:flex-row md:items-center">
               <p className="text-emerald-100">
-                已生成《{downloadResult.title}》，共 {downloadResult.chapterCount} 个章节片段，浏览器已开始下载。
+                已生成《{downloadResult.title}》，共 {downloadResult.chapterCount} 章，浏览器已开始下载。
               </p>
               <button className="rounded-xl bg-white/10 px-4 py-2 text-sm text-slate-200" type="button" onClick={clearDownload}>
                 知道了
@@ -482,10 +499,10 @@ function App() {
                       <button
                         className="shrink-0 rounded-xl bg-emerald-300 px-5 py-2.5 font-bold text-slate-950 disabled:opacity-60"
                         type="button"
-                        disabled={Boolean(downloadingUrl)}
-                        onClick={() => void downloadSource(source, sourceSearchResult.title)}
+                        disabled={loading || Boolean(downloadingUrl)}
+                        onClick={() => void scanChapters(source, sourceSearchResult.title)}
                       >
-                        {downloadingUrl === source.url ? '生成中…' : '从此网站下载'}
+                        {loading && chapterSource?.url === source.url ? '扫描章节中…' : '扫描章节并下载'}
                       </button>
                     </div>
                   </article>
@@ -493,6 +510,103 @@ function App() {
               </div>
             )}
             {error && <p className="mt-4 text-sm text-red-300">{error}</p>}
+          </section>
+        </div>
+      )}
+
+      {chapterListResult && chapterSource && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 px-4 backdrop-blur-sm">
+          <section className="glass-panel flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden p-6">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-2xl font-bold text-white">选择《{chapterListResult.title}》下载范围</h2>
+                <p className="mt-2 text-sm text-slate-300">
+                  {chapterSource.siteName} · 已扫描到 {chapterListResult.chapters.length} 章
+                </p>
+              </div>
+              <button className="rounded-xl bg-white/10 px-4 py-2 text-slate-300" type="button" onClick={closeChapterPicker}>
+                关闭
+              </button>
+            </div>
+
+            <div className="mt-5 grid grid-cols-2 gap-3 rounded-2xl bg-slate-950/60 p-2">
+              <button
+                className={`rounded-xl px-4 py-3 font-semibold transition ${chapterMode === 'all' ? 'bg-cyan-300 text-slate-950' : 'text-slate-300 hover:bg-white/10'}`}
+                type="button"
+                onClick={() => setChapterMode('all')}
+              >
+                全本下载
+              </button>
+              <button
+                className={`rounded-xl px-4 py-3 font-semibold transition ${chapterMode === 'partial' ? 'bg-violet-300 text-slate-950' : 'text-slate-300 hover:bg-white/10'}`}
+                type="button"
+                onClick={() => setChapterMode('partial')}
+              >
+                部分下载
+              </button>
+            </div>
+
+            {chapterMode === 'all' ? (
+              <div className="mt-5 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-5 text-cyan-100">
+                将按目录顺序下载全部 {chapterListResult.chapters.length} 章。
+              </div>
+            ) : (
+              <div className="mt-5 flex min-h-0 flex-1 flex-col">
+                <div className="mb-3 flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-300">已选择 {selectedChapterUrls.size} / {chapterListResult.chapters.length} 章</span>
+                  <div className="flex gap-2">
+                    <button
+                      className="rounded-lg bg-white/10 px-3 py-1.5 text-slate-200"
+                      type="button"
+                      onClick={() => setSelectedChapterUrls(new Set(chapterListResult.chapters.map((chapter) => chapter.url)))}
+                    >
+                      全选
+                    </button>
+                    <button className="rounded-lg bg-white/10 px-3 py-1.5 text-slate-200" type="button" onClick={() => setSelectedChapterUrls(new Set())}>
+                      清空
+                    </button>
+                  </div>
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/60 p-2">
+                  {chapterListResult.chapters.map((chapter, index) => (
+                    <label key={chapter.url} className="flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-slate-200 hover:bg-white/[0.06]">
+                      <input
+                        className="h-4 w-4 accent-violet-400"
+                        type="checkbox"
+                        checked={selectedChapterUrls.has(chapter.url)}
+                        onChange={(event) => {
+                          setSelectedChapterUrls((current) => {
+                            const next = new Set(current);
+                            if (event.target.checked) next.add(chapter.url);
+                            else next.delete(chapter.url);
+                            return next;
+                          });
+                        }}
+                      />
+                      <span className="w-12 shrink-0 text-right font-mono text-xs text-slate-500">{index + 1}</span>
+                      <span>{chapter.title}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {error && <p className="mt-4 text-sm text-red-300">{error}</p>}
+            <div className="mt-5 flex justify-end">
+              <button
+                className="rounded-xl bg-emerald-300 px-6 py-3 font-bold text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                type="button"
+                disabled={Boolean(downloadingUrl) || (chapterMode === 'partial' && selectedChapterUrls.size === 0)}
+                onClick={() => {
+                  const chapters = chapterMode === 'all'
+                    ? chapterListResult.chapters
+                    : chapterListResult.chapters.filter((chapter) => selectedChapterUrls.has(chapter.url));
+                  void downloadChapters(chapterSource, chapterListResult.title, chapters);
+                }}
+              >
+                {downloadingUrl ? '正在生成 TXT…' : chapterMode === 'all' ? '下载全本' : `下载所选 ${selectedChapterUrls.size} 章`}
+              </button>
+            </div>
           </section>
         </div>
       )}
