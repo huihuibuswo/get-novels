@@ -30,7 +30,9 @@ function ShootingStars() {
   );
 }
 
-function CrawlProgress({ active, mode }: { active: boolean; mode: 'scan' | 'download' }) {
+type ProgressMode = 'site' | 'novels' | 'sources' | 'download';
+
+function CrawlProgress({ active, mode }: { active: boolean; mode: ProgressMode }) {
   const [progress, setProgress] = React.useState(0);
 
   React.useEffect(() => {
@@ -43,7 +45,7 @@ function CrawlProgress({ active, mode }: { active: boolean; mode: 'scan' | 'down
     setProgress(8);
     const interval = window.setInterval(() => {
       setProgress((current) => {
-        const ceiling = mode === 'scan' ? 92 : 88;
+        const ceiling = mode === 'download' ? 88 : 92;
         if (current >= ceiling) {
           return current;
         }
@@ -60,15 +62,19 @@ function CrawlProgress({ active, mode }: { active: boolean; mode: 'scan' | 'down
   }
 
   const status = active
-    ? mode === 'scan'
+    ? mode === 'site'
       ? progress < 35
         ? '正在连接站点...'
         : progress < 72
           ? '正在提取主分类与标签...'
           : '正在清洗小说候选数据...'
-      : progress < 45
-        ? '正在定位章节目录...'
-        : '正在格式化 TXT 文件...'
+      : mode === 'novels'
+        ? '正在全网模糊匹配小说...'
+        : mode === 'sources'
+          ? '正在验证可下载网站...'
+          : progress < 45
+            ? '正在定位章节目录...'
+            : '正在格式化 TXT 文件...'
     : '处理完成';
 
   return (
@@ -101,10 +107,13 @@ function App() {
     search,
     activeCategory,
     loading,
+    loadingAction,
     downloadingUrl,
     error,
     captchaUrl,
     result,
+    novelSearchResult,
+    sourceSearchResult,
     downloadResult,
     showLogin,
     setUrl,
@@ -115,7 +124,11 @@ function App() {
     setShowLogin,
     clearCaptcha,
     indexSite,
+    searchNovels,
+    searchSources,
+    closeSources,
     downloadNovel,
+    downloadSource,
     clearDownload,
   } = useCrawlerStore();
 
@@ -189,7 +202,7 @@ function App() {
   // 当前切片渲染的数据
   const displayedNovels = filteredNovels.slice(0, visibleCount);
   const isBusy = loading || Boolean(downloadingUrl);
-  const progressMode = downloadingUrl ? 'download' : 'scan';
+  const progressMode: ProgressMode = downloadingUrl ? 'download' : loadingAction || 'site';
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#0b0b0c] text-slate-100">
@@ -210,7 +223,7 @@ function App() {
             </span>
           </h1>
           <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300">
-            自动读取原站主分类与详情页标签，搜索命中后再抓章节正文并清洗成适合阅读的 TXT。
+            可扫描指定网站，也可按小说名全网模糊搜索；选定小说后验证可下载网站，再抓取并清洗为 TXT。
           </p>
         </div>
 
@@ -218,25 +231,76 @@ function App() {
           className="glass-panel p-4"
           onSubmit={(event) => {
             event.preventDefault();
-            void indexSite();
+            if (/^https?:\/\//i.test(url.trim())) {
+              void indexSite();
+            } else {
+              void searchNovels();
+            }
           }}
         >
           <div className="flex flex-col gap-3 md:flex-row">
             <input
               className="min-w-0 flex-1 rounded-2xl border border-white/10 bg-[#080b12]/90 px-5 py-4 text-base text-slate-100 outline-none ring-cyan-400/30 transition placeholder:text-slate-500 focus:border-cyan-300/40 focus:ring-4"
-              placeholder="https://example.com"
+              placeholder="输入网站网址，或输入小说名称"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
             />
             <button
+              type="button"
               className="rounded-2xl bg-gradient-to-r from-cyan-400 via-violet-400 to-rose-500 px-7 py-4 font-bold text-slate-950 shadow-[0_0_28px_rgba(34,211,238,0.28)] transition hover:scale-[1.01] hover:shadow-[0_0_36px_rgba(168,85,247,0.35)] disabled:cursor-not-allowed disabled:opacity-60"
               disabled={loading}
+              onClick={() => void indexSite()}
             >
-              {loading ? '扫描中…' : '扫描小说'}
+              {loading && loadingAction === 'site' ? '扫描中…' : '扫描网站'}
+            </button>
+            <button
+              type="button"
+              className="rounded-2xl border border-violet-300/40 bg-violet-400/15 px-7 py-4 font-bold text-violet-100 shadow-[0_0_24px_rgba(167,139,250,0.16)] transition hover:bg-violet-400/25 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={loading}
+              onClick={() => void searchNovels()}
+            >
+              {loading && loadingAction === 'novels' ? '搜索中…' : '扫描小说'}
             </button>
           </div>
           {error && <p className="mt-3 text-sm text-red-300">{error}</p>}
         </form>
+
+        {novelSearchResult && (
+          <section className="glass-panel mt-8 p-6">
+            <div className="mb-5">
+              <h2 className="text-2xl font-bold text-white">“{novelSearchResult.query}”的模糊匹配</h2>
+              <p className="mt-1 text-sm text-slate-400">点击下载后会继续全网检索，并只展示已识别到章节入口的网站。</p>
+            </div>
+            {novelSearchResult.novels.length === 0 ? (
+              <p className="text-slate-300">没有找到匹配的小说，请尝试更完整或更短的书名。</p>
+            ) : (
+              <div className="grid gap-4">
+                {novelSearchResult.novels.map((novel) => (
+                  <article key={novel.title} className="novel-card p-5">
+                    <div className="flex flex-col justify-between gap-4 md:flex-row md:items-start">
+                      <div>
+                        <h3 className="text-lg font-semibold text-cyan-200">{novel.title}</h3>
+                        <p className="mt-2 text-sm text-slate-400">{novel.description || '搜索结果未提供简介'}</p>
+                        <div className="mt-3 flex gap-2 text-xs">
+                          <StatPill>匹配 {novel.matchScore}%</StatPill>
+                          <StatPill>搜索线索 {novel.sourceCount}</StatPill>
+                        </div>
+                      </div>
+                      <button
+                        className="shrink-0 rounded-2xl border border-emerald-300/30 bg-emerald-300/90 px-5 py-3 font-bold text-slate-950 transition hover:bg-emerald-200 disabled:opacity-60"
+                        type="button"
+                        disabled={loading || Boolean(downloadingUrl)}
+                        onClick={() => void searchSources(novel.title)}
+                      >
+                        搜索下载网站
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
 
         {result && (
           <section className="glass-panel mt-8 p-6">
@@ -390,6 +454,48 @@ function App() {
           </section>
         )}
       </section>
+
+      {sourceSearchResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm">
+          <section className="glass-panel max-h-[85vh] w-full max-w-3xl overflow-y-auto p-6">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-2xl font-bold text-white">选择《{sourceSearchResult.title}》的下载网站</h2>
+                <p className="mt-2 text-sm text-slate-300">已过滤未发现章节入口的网站；最终可下载性仍取决于目标站实时状态。</p>
+              </div>
+              <button className="rounded-xl bg-white/10 px-4 py-2 text-slate-300" type="button" onClick={closeSources}>关闭</button>
+            </div>
+            {sourceSearchResult.sources.length === 0 ? (
+              <p className="mt-6 rounded-2xl border border-amber-300/20 bg-amber-300/10 p-4 text-amber-100">
+                暂未找到可识别章节入口的网站，可以更换小说名称后重试。
+              </p>
+            ) : (
+              <div className="mt-6 grid gap-3">
+                {sourceSearchResult.sources.map((source) => (
+                  <article key={source.url} className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                    <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+                      <div className="min-w-0">
+                        <h3 className="font-semibold text-cyan-200">{source.siteName}</h3>
+                        <p className="mt-1 line-clamp-2 text-sm text-slate-400">{source.description || source.url}</p>
+                        <p className="mt-2 truncate font-mono text-xs text-slate-500">{source.url}</p>
+                      </div>
+                      <button
+                        className="shrink-0 rounded-xl bg-emerald-300 px-5 py-2.5 font-bold text-slate-950 disabled:opacity-60"
+                        type="button"
+                        disabled={Boolean(downloadingUrl)}
+                        onClick={() => void downloadSource(source, sourceSearchResult.title)}
+                      >
+                        {downloadingUrl === source.url ? '生成中…' : '从此网站下载'}
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+            {error && <p className="mt-4 text-sm text-red-300">{error}</p>}
+          </section>
+        </div>
+      )}
 
       {showLogin && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm">

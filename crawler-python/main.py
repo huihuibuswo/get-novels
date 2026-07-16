@@ -4,10 +4,14 @@ import socket
 import random
 import time
 import threading
+import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
 from ipaddress import ip_address
 from collections import deque
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib import robotparser
 
 from dotenv import load_dotenv
@@ -165,6 +169,8 @@ proxy_manager = ProxyManager()
 
 MAX_INDEX_PAGES = 30
 MAX_NOVEL_DETAIL_PAGES = 60
+MAX_SEARCH_RESULTS = 20
+MAX_SOURCE_CHECKS = 10
 TIMEOUT_SECONDS = 15
 MAX_REDIRECTS = 5
 MIN_REQUEST_INTERVAL_SECONDS = 1.0
@@ -213,6 +219,14 @@ class DownloadRequest(BaseModel):
     credentials: Optional[Credentials] = None
 
 
+class NovelSearchRequest(BaseModel):
+    query: str
+
+
+class SourceSearchRequest(BaseModel):
+    title: str
+
+
 class NovelCandidate(BaseModel):
     title: str
     url: str
@@ -239,6 +253,107 @@ class DownloadResponse(BaseModel):
     filename: str
     content: str
     chapterCount: int
+
+
+class WebNovelCandidate(BaseModel):
+    title: str
+    description: str
+    matchScore: int
+    sourceCount: int
+
+
+class NovelSearchResponse(BaseModel):
+    query: str
+    novels: list[WebNovelCandidate]
+
+
+class DownloadSource(BaseModel):
+    siteName: str
+    url: str
+    description: str
+    chapterHints: int
+
+
+class SourceSearchResponse(BaseModel):
+    title: str
+    sources: list[DownloadSource]
+
+
+@app.post("/search/novels")
+def search_novels(request: NovelSearchRequest) -> NovelSearchResponse:
+    query = normalize_search_text(request.query, "小说名称")
+    results = web_search(f'"{query}" 小说')
+    grouped: dict[str, WebNovelCandidate] = {}
+    for result_title, _, description in results:
+        title = extract_search_novel_title(result_title, query)
+        score = fuzzy_match_score(query, title)
+        if score < 55:
+            continue
+        key = normalize_title_key(title)
+        if not key:
+            continue
+        existing = grouped.get(key)
+        if existing:
+            existing.sourceCount += 1
+            if len(description) > len(existing.description):
+                existing.description = description
+            existing.matchScore = max(existing.matchScore, score)
+        else:
+            grouped[key] = WebNovelCandidate(
+                title=title,
+                description=description[:240],
+                matchScore=score,
+                sourceCount=1,
+            )
+    novels = sorted(grouped.values(), key=lambda item: (item.matchScore, item.sourceCount), reverse=True)[:12]
+    return NovelSearchResponse(query=query, novels=novels)
+
+
+@app.post("/search/sources")
+def search_download_sources(request: SourceSearchRequest) -> SourceSearchResponse:
+    title = normalize_search_text(request.title, "小说名称")
+    results = unique_search_results(
+        web_search(f'"{title}"') + web_search(f'"{title}" 小说 目录 在线阅读')
+    )
+    sources: list[DownloadSource] = []
+    seen_hosts: set[str] = set()
+    session = build_session()
+
+    for _, result_url, description in results[:MAX_SOURCE_CHECKS]:
+        host = (urlparse(result_url).hostname or "").lower()
+        if not host or host in seen_hosts or is_non_download_source(host):
+            continue
+        try:
+            response = fetch(session, result_url, raise_for_status=False)
+            if response.status_code != 200 or "text/html" not in response.headers.get("content-type", ""):
+                continue
+            soup = clean_soup(response.text)
+            page_title = extract_title(response.url, soup)
+            if fuzzy_match_score(title, page_title) < 35:
+                continue
+            root_host = urlparse(response.url).netloc
+            links = extract_strong_chapter_links(response.url, soup, root_host)
+            start_url = find_start_chapter_url(response.url, soup, root_host)
+            catalog_url = extract_catalog_url(response.url, soup, root_host)
+            if not start_url and not catalog_url and not links:
+                continue
+            page_text = " ".join(soup.get_text(" ").split())
+            metadata_signals = sum(1 for signal in ("作者", "小说", "章节", "目录", "最新章节") if signal in page_text)
+            if metadata_signals < 2:
+                continue
+            sources.append(DownloadSource(
+                siteName=display_host(host),
+                url=response.url,
+                description=description[:240],
+                chapterHints=max(len(links), 1 if start_url or catalog_url else 0),
+            ))
+            seen_hosts.add(host)
+        except (HTTPException, requests.RequestException):
+            continue
+        except Exception:
+            continue
+
+    return SourceSearchResponse(title=title, sources=sources)
 
 
 @app.post("/index")
@@ -410,9 +525,219 @@ def download_novel(request: DownloadRequest) -> DownloadResponse:
     )
 
 
+def normalize_search_text(value: str, field_name: str) -> str:
+    text = " ".join(value.split()).strip()
+    if not text:
+        raise HTTPException(status_code=422, detail=f"请输入{field_name}")
+    if len(text) > 80:
+        raise HTTPException(status_code=422, detail=f"{field_name}不能超过 80 个字符")
+    return text
+
+
+def web_search(query: str) -> list[tuple[str, str, str]]:
+    bing_error: Optional[HTTPException] = None
+    try:
+        results = bing_rss_search(query)
+        if results:
+            return results
+    except HTTPException as error:
+        bing_error = error
+
+    try:
+        return duckduckgo_html_search(query)
+    except HTTPException as error:
+        bing_detail = f"；Bing：{bing_error.detail}" if bing_error else "；Bing 未返回结果"
+        raise HTTPException(
+            status_code=502,
+            detail=f"搜索服务暂时不可用{bing_detail}；DuckDuckGo：{error.detail}",
+        ) from error
+
+
+def bing_rss_search(query: str) -> list[tuple[str, str, str]]:
+    endpoint = os.getenv("NOVEL_SEARCH_RSS_URL", "https://www.bing.com/search?format=rss&q={query}")
+    if "{query}" not in endpoint:
+        raise HTTPException(status_code=500, detail="NOVEL_SEARCH_RSS_URL 必须包含 {query} 占位符")
+    search_url = endpoint.replace("{query}", quote_plus(query))
+    response = request_search_provider(search_url, "Bing")
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as error:
+        raise HTTPException(status_code=502, detail="返回了无法识别的 RSS 数据") from error
+
+    results: list[tuple[str, str, str]] = []
+    for item in root.findall(".//item"):
+        title = " ".join((item.findtext("title") or "").split())
+        url = (item.findtext("link") or "").strip()
+        description_html = item.findtext("description") or ""
+        description_text = BeautifulSoup(description_html, "html.parser").get_text(" ") if "<" in description_html else description_html
+        description = " ".join(description_text.split())
+        parsed = urlparse(url)
+        if title and parsed.scheme in ("http", "https") and parsed.hostname:
+            results.append((title, url, description))
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+    return results
+
+
+def duckduckgo_html_search(query: str) -> list[tuple[str, str, str]]:
+    endpoint = os.getenv("DUCKDUCKGO_HTML_URL", "https://lite.duckduckgo.com/lite/?q={query}")
+    if "{query}" not in endpoint:
+        raise HTTPException(status_code=500, detail="DUCKDUCKGO_HTML_URL 必须包含 {query} 占位符")
+    response_url, response_html = request_duckduckgo_provider(endpoint.replace("{query}", quote_plus(query)))
+    soup = BeautifulSoup(response_html, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    for link in soup.select("a.result__a[href], a.result-link[href]"):
+        title = " ".join(link.get_text(" ").split())
+        url = extract_duckduckgo_target(urljoin(response_url, link.get("href") or ""))
+        snippet = link.find_next(class_=["result__snippet", "result-snippet"])
+        description = " ".join(snippet.get_text(" ").split()) if snippet else ""
+        parsed = urlparse(url)
+        if title and parsed.scheme in ("http", "https") and parsed.hostname:
+            results.append((title, url, description))
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+    return results
+
+
+class NoSearchRedirect(urllib_request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def request_duckduckgo_provider(search_url: str) -> tuple[str, str]:
+    proxy = proxy_manager.get_proxy(force_rotate=False) or {}
+    proxy_handler = urllib_request.ProxyHandler(proxy) if proxy else urllib_request.ProxyHandler()
+    opener = urllib_request.build_opener(proxy_handler, NoSearchRedirect())
+    current_url = search_url
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
+    for _ in range(MAX_REDIRECTS + 1):
+        validate_fetch_url(current_url)
+        request = urllib_request.Request(current_url, headers={"User-Agent": user_agent, "Accept-Language": "zh-CN,zh;q=0.9"})
+        try:
+            response = opener.open(request, timeout=TIMEOUT_SECONDS)
+        except urllib_error.HTTPError as error:
+            if error.code in (301, 302, 303, 307, 308) and error.headers.get("Location"):
+                current_url = urljoin(current_url, error.headers["Location"])
+                continue
+            raise HTTPException(status_code=502, detail=f"返回 HTTP {error.code}") from error
+        except Exception as error:
+            raise HTTPException(status_code=502, detail="请求失败") from error
+
+        content = response.read(2_000_001)
+        if len(content) > 2_000_000:
+            raise HTTPException(status_code=502, detail="返回数据过大")
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.geturl(), content.decode(charset, errors="replace")
+    raise HTTPException(status_code=502, detail="重定向次数过多")
+
+
+def extract_duckduckgo_target(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.hostname and (parsed.hostname == "duckduckgo.com" or parsed.hostname.endswith(".duckduckgo.com")):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            return unquote(target)
+    return url
+
+
+def request_search_provider(search_url: str, provider_name: str) -> requests.Response:
+    session = build_session()
+    try:
+        response = None
+        current_url = search_url
+        for _ in range(MAX_REDIRECTS + 1):
+            validate_fetch_url(current_url)
+            response = session.get(
+                current_url,
+                timeout=TIMEOUT_SECONDS,
+                allow_redirects=False,
+                proxies=proxy_manager.get_proxy(force_rotate=False),
+            )
+            if not response.is_redirect:
+                break
+            location = response.headers.get("location")
+            if not location:
+                break
+            current_url = urljoin(response.url, location)
+        if response is None or response.is_redirect:
+            raise ValueError("搜索服务重定向次数过多")
+        response.encoding = response.apparent_encoding or response.encoding
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"{provider_name} 请求失败") from error
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"返回 HTTP {response.status_code}")
+    return response
+
+
+def extract_search_novel_title(result_title: str, query: str) -> str:
+    title = re.sub(r"^[《\u300c\u300e](.*?)[》\u300d\u300f].*$", r"\1", result_title).strip()
+    if title == result_title.strip():
+        title = re.split(
+            r"\s*[（(]\s*|\s*[-_|｜—]\s*|(?:最新章节|全文阅读|免费阅读|小说在线阅读|章节列表|百度百科|起点中文网).*$",
+            title,
+            maxsplit=1,
+        )[0].strip(" 《》\u300c\u300d\u300e\u300f")
+    if not title or len(title) > 60:
+        return query
+    return title.strip(" \t\r\n，。！？、,.!?：:；;《》\u300c\u300d\u300e\u300f")
+
+
+def normalize_title_key(title: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", title.lower())
+
+
+def fuzzy_match_score(query: str, candidate: str) -> int:
+    query_key = normalize_title_key(query)
+    candidate_key = normalize_title_key(candidate)
+    if not query_key or not candidate_key:
+        return 0
+    if query_key == candidate_key:
+        return 100
+    if query_key in candidate_key or candidate_key in query_key:
+        shorter, longer = sorted((len(query_key), len(candidate_key)))
+        return max(70, round(shorter / longer * 100))
+    return round(SequenceMatcher(None, query_key, candidate_key).ratio() * 100)
+
+
+def is_non_download_source(host: str) -> bool:
+    blocked = (
+        "bing.com", "baidu.com", "baike.baidu.com", "zhihu.com", "douban.com",
+        "wikipedia.org", "weibo.com", "bilibili.com", "tieba.baidu.com", "cctv.com",
+        "qq.com", "iqiyi.com", "youku.com",
+    )
+    return any(host == domain or host.endswith(f".{domain}") for domain in blocked)
+
+
+def display_host(host: str) -> str:
+    return host[4:] if host.startswith("www.") else host
+
+
+def unique_search_results(results: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    unique: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for item in results:
+        url = normalize_url(item[1])
+        if url not in seen:
+            unique.append((item[0], url, item[2]))
+            seen.add(url)
+    return unique
+
+
+def extract_strong_chapter_links(page_url: str, soup: BeautifulSoup, root_host: str) -> list[str]:
+    links: list[str] = []
+    for tag in soup.find_all("a", href=True):
+        text = " ".join(tag.get_text(" ").split())
+        href = normalize_url(urljoin(page_url, tag["href"]))
+        if urlparse(href).netloc != root_host or is_catalog_link(text, href):
+            continue
+        if score_chapter_anchor(text, href) >= 5:
+            links.append(href)
+    return unique_urls(links)
+
+
 def build_session() -> requests.Session:
     # 随机选择浏览器类型和版本指纹以应对更严格的风控
-    impersonate_targets = ["chrome", "edge", "safari", "chrome110", "edge101", "safari15.5"]
+    impersonate_targets = ["chrome", "edge", "safari", "chrome110", "edge101"]
     selected_impersonate = random.choice(impersonate_targets)
     session = Session(impersonate=selected_impersonate)
     session.headers.update({

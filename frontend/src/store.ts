@@ -30,6 +30,23 @@ type DownloadResult = {
   chapterCount: number;
 };
 
+type WebNovelCandidate = {
+  title: string;
+  description: string;
+  matchScore: number;
+  sourceCount: number;
+};
+
+type DownloadSource = {
+  siteName: string;
+  url: string;
+  description: string;
+  chapterHints: number;
+};
+
+type NovelSearchResult = { query: string; novels: WebNovelCandidate[] };
+type SourceSearchResult = { title: string; sources: DownloadSource[] };
+
 type CrawlCredentials = {
   username: string;
   password: string;
@@ -42,11 +59,14 @@ type CrawlerStore = {
   search: string;
   activeCategory: string;
   loading: boolean;
+  loadingAction: 'site' | 'novels' | 'sources' | '';
   downloadingUrl: string;
   error: string;
   captchaUrl: string;
   showLogin: boolean;
   result: IndexResult | null;
+  novelSearchResult: NovelSearchResult | null;
+  sourceSearchResult: SourceSearchResult | null;
   downloadResult: DownloadResult | null;
   setUrl: (url: string) => void;
   setUsername: (username: string) => void;
@@ -56,7 +76,11 @@ type CrawlerStore = {
   setShowLogin: (showLogin: boolean) => void;
   clearCaptcha: () => void;
   indexSite: (credentials?: CrawlCredentials) => Promise<void>;
+  searchNovels: () => Promise<void>;
+  searchSources: (title: string) => Promise<void>;
+  closeSources: () => void;
   downloadNovel: (novel: NovelCandidate) => Promise<void>;
+  downloadSource: (source: DownloadSource, title: string) => Promise<void>;
   clearDownload: () => void;
 };
 
@@ -67,11 +91,14 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
   search: '',
   activeCategory: '全部',
   loading: false,
+  loadingAction: '',
   downloadingUrl: '',
   error: '',
   captchaUrl: '',
   showLogin: false,
   result: null,
+  novelSearchResult: null,
+  sourceSearchResult: null,
   downloadResult: null,
   setUrl: (url) => set({ url }),
   setUsername: (username) => set({ username }),
@@ -87,7 +114,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       return;
     }
 
-    set({ loading: true, error: '', downloadResult: null });
+    set({ loading: true, loadingAction: 'site', error: '', downloadResult: null, novelSearchResult: null, sourceSearchResult: null });
     try {
       const response = await fetch(`${API_BASE_URL || '/api'}/index`, {
         method: 'POST',
@@ -96,7 +123,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       });
 
       if (!response.ok) {
-        throw new Error(await response.text());
+        throw new Error(await readApiError(response));
       }
 
       const result = (await response.json()) as IndexResult;
@@ -104,15 +131,51 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
         result,
         showLogin: result.requiresLogin,
         loading: false,
+        loadingAction: '',
         password: result.requiresLogin ? get().password : '',
       });
     } catch (error) {
       set({
         loading: false,
+        loadingAction: '',
         error: error instanceof Error ? error.message : '抓取失败',
       });
     }
   },
+  searchNovels: async () => {
+    const query = get().url.trim();
+    if (!query) {
+      set({ error: '请输入小说名称' });
+      return;
+    }
+    set({ loading: true, loadingAction: 'novels', error: '', result: null, novelSearchResult: null, sourceSearchResult: null, downloadResult: null });
+    try {
+      const response = await fetch(`${API_BASE_URL || '/api'}/search/novels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response));
+      set({ novelSearchResult: (await response.json()) as NovelSearchResult, loading: false, loadingAction: '' });
+    } catch (error) {
+      set({ loading: false, loadingAction: '', error: error instanceof Error ? error.message : '全网搜索失败' });
+    }
+  },
+  searchSources: async (title) => {
+    set({ loading: true, loadingAction: 'sources', error: '', sourceSearchResult: null });
+    try {
+      const response = await fetch(`${API_BASE_URL || '/api'}/search/sources`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response));
+      set({ sourceSearchResult: (await response.json()) as SourceSearchResult, loading: false, loadingAction: '' });
+    } catch (error) {
+      set({ loading: false, loadingAction: '', error: error instanceof Error ? error.message : '下载网站搜索失败' });
+    }
+  },
+  closeSources: () => set({ sourceSearchResult: null }),
   downloadNovel: async (novel) => {
     const { username, password, showLogin } = get();
     set({ downloadingUrl: novel.url, error: '', captchaUrl: '', downloadResult: null });
@@ -128,7 +191,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       });
 
       if (!response.ok) {
-        const text = await response.text();
+        const text = await readApiError(response);
         const captchaUrl = text.match(/https?:\/\/[^\s"'}]+captcha[^\s"'}]*/i)?.[0] ?? '';
         set({ captchaUrl });
         throw new Error(text);
@@ -142,7 +205,7 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       anchor.download = downloadResult.filename;
       anchor.click();
       URL.revokeObjectURL(href);
-      set({ downloadResult, downloadingUrl: '' });
+      set({ downloadResult, downloadingUrl: '', sourceSearchResult: null });
     } catch (error) {
       set({
         downloadingUrl: '',
@@ -150,5 +213,30 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
       });
     }
   },
+  downloadSource: async (source, title) => {
+    const novel: NovelCandidate = {
+      title,
+      url: source.url,
+      category: '全网搜索',
+      tags: [],
+      description: source.description,
+      score: 0,
+      matchedKeywords: [],
+      wordCount: 0,
+      textLength: 0,
+      chapterHints: source.chapterHints,
+    };
+    await get().downloadNovel(novel);
+  },
   clearDownload: () => set({ downloadResult: null }),
 }));
+
+async function readApiError(response: Response) {
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text) as { detail?: string };
+    return parsed.detail || text;
+  } catch {
+    return text;
+  }
+}
