@@ -84,7 +84,7 @@ function CrawlProgress({ active, mode }: { active: boolean; mode: ProgressMode }
       <div className="mx-auto flex max-w-6xl flex-col gap-2">
         <div className="flex items-center justify-between text-xs text-slate-300">
           <span className="tracking-[0.28em] text-cyan-200">{status}</span>
-          <span className="font-mono text-cyan-100">{Math.round(progress)}%</span>
+          <span className="font-code text-cyan-100">{Math.round(progress)}%</span>
         </div>
         <div className="h-2 overflow-hidden rounded-full bg-slate-950 ring-1 ring-white/10">
           <div
@@ -217,30 +217,39 @@ function App() {
   const progressMode: ProgressMode = downloadingUrl ? 'download' : loadingAction || 'site';
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#0b0b0c] text-slate-100">
+    <main className="relative min-h-screen overflow-hidden bg-[#05060a] text-slate-100">
+      <div className="aurora" aria-hidden="true">
+        <div className="aurora__blob aurora__blob--cyan" />
+        <div className="aurora__blob aurora__blob--violet" />
+        <div className="aurora__blob aurora__blob--rose" />
+      </div>
+      <div className="tech-grid" aria-hidden="true" />
+      <div className="scan-overlay" aria-hidden="true" />
       <ShootingStars />
       <CrawlProgress active={isBusy} mode={progressMode} />
-      <div className="pointer-events-none absolute inset-0 z-0 bg-[radial-gradient(circle_at_20%_10%,rgba(168,85,247,0.20),transparent_26%),radial-gradient(circle_at_85%_20%,rgba(6,182,212,0.16),transparent_24%),linear-gradient(135deg,#0b0b0c_0%,#0f172a_55%,#120812_100%)]" />
-      <div className="pointer-events-none absolute inset-0 z-0 bg-[linear-gradient(rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px)] bg-[size:48px_48px] opacity-40" />
       <section className="relative z-10 mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-14 md:py-20">
-        <div className="mb-8 max-w-4xl">
-          <div className="mb-4 inline-flex items-center gap-3 rounded-full border border-cyan-300/20 bg-cyan-300/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.35em] text-cyan-200 shadow-[0_0_24px_rgba(34,211,238,0.12)]">
-            <span className="h-2 w-2 rounded-full bg-cyan-300 shadow-[0_0_16px_#67e8f9]" />
-            Get Novels
+        <div className="mb-8 max-w-4xl reveal">
+          <div className="mb-5 inline-flex items-center gap-3 rounded-full border border-cyan-300/25 bg-cyan-300/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.4em] text-cyan-200 shadow-[0_0_24px_rgba(34,211,238,0.14)]">
+            <span className="pulse-dot h-2 w-2 rounded-full bg-cyan-300" />
+            <span className="font-tech">GET · NOVELS</span>
+            <span className="font-code text-[10px] tracking-[0.2em] text-cyan-300/60">v2.0</span>
           </div>
-          <h1 className="max-w-3xl text-4xl font-black tracking-tight text-white md:text-6xl">
+          <h1 className="font-display max-w-3xl text-4xl font-bold tracking-tight text-white md:text-6xl">
             暗夜书库扫描器
-            <span className="block bg-gradient-to-r from-cyan-200 via-violet-200 to-rose-200 bg-clip-text text-transparent">
-              先发现，再精准爬取
-            </span>
+            <span className="title-glow block">先发现，再精准爬取</span>
           </h1>
-          <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300">
+          <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300/90">
             可扫描指定网站，也可按小说名全网模糊搜索；选定小说后验证可下载网站，再抓取并清洗为 TXT。
           </p>
+          <div className="mt-6 flex flex-wrap gap-2 font-code text-[11px] tracking-wider text-slate-400">
+            <span className="rounded-md border border-white/10 bg-white/[0.03] px-2.5 py-1">全网模糊搜索</span>
+            <span className="rounded-md border border-white/10 bg-white/[0.03] px-2.5 py-1">章节精准定位</span>
+            <span className="rounded-md border border-white/10 bg-white/[0.03] px-2.5 py-1">TXT 自动清洗</span>
+          </div>
         </div>
 
         <form
-          className="glass-panel p-4"
+          className="glass-panel hud p-4 reveal"
           onSubmit={(event) => {
             event.preventDefault();
             if (/^https?:\/\//i.test(url.trim())) {
@@ -252,14 +261,14 @@ function App() {
         >
           <div className="flex flex-col gap-3 md:flex-row">
             <input
-              className="min-w-0 flex-1 rounded-2xl border border-white/10 bg-[#080b12]/90 px-5 py-4 text-base text-slate-100 outline-none ring-cyan-400/30 transition placeholder:text-slate-500 focus:border-cyan-300/40 focus:ring-4"
+              className="input-tech min-w-0 flex-1 px-5 py-4 text-base"
               placeholder="输入网站网址，或输入小说名称"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
             />
             <button
               type="button"
-              className="rounded-2xl bg-gradient-to-r from-cyan-400 via-violet-400 to-rose-500 px-7 py-4 font-bold text-slate-950 shadow-[0_0_28px_rgba(34,211,238,0.28)] transition hover:scale-[1.01] hover:shadow-[0_0_36px_rgba(168,85,247,0.35)] disabled:cursor-not-allowed disabled:opacity-60"
+              className="btn-neon px-7 py-4"
               disabled={loading}
               onClick={() => void indexSite()}
             >
@@ -267,7 +276,7 @@ function App() {
             </button>
             <button
               type="button"
-              className="rounded-2xl border border-violet-300/40 bg-violet-400/15 px-7 py-4 font-bold text-violet-100 shadow-[0_0_24px_rgba(167,139,250,0.16)] transition hover:bg-violet-400/25 disabled:cursor-not-allowed disabled:opacity-60"
+              className="btn-ghost px-7 py-4"
               disabled={loading}
               onClick={() => void searchNovels()}
             >
@@ -278,9 +287,9 @@ function App() {
         </form>
 
         {novelSearchResult && (
-          <section className="glass-panel mt-8 p-6">
+          <section className="glass-panel reveal mt-8 p-6">
             <div className="mb-5">
-              <h2 className="text-2xl font-bold text-white">“{novelSearchResult.query}”的模糊匹配</h2>
+              <h2 className="font-display text-2xl font-bold text-white">“{novelSearchResult.query}”的模糊匹配</h2>
               <p className="mt-1 text-sm text-slate-400">点击下载后会继续全网检索，并只展示已识别到章节入口的网站。</p>
             </div>
             {novelSearchResult.novels.length === 0 ? (
@@ -299,7 +308,7 @@ function App() {
                         </div>
                       </div>
                       <button
-                        className="shrink-0 rounded-2xl border border-emerald-300/30 bg-emerald-300/90 px-5 py-3 font-bold text-slate-950 transition hover:bg-emerald-200 disabled:opacity-60"
+                        className="btn-emerald shrink-0 px-5 py-3"
                         type="button"
                         disabled={loading || Boolean(downloadingUrl)}
                         onClick={() => void searchSources(novel.title)}
@@ -315,20 +324,20 @@ function App() {
         )}
 
         {result && (
-          <section className="glass-panel mt-8 p-6">
+          <section className="glass-panel reveal mt-8 p-6">
             <div className="mb-5 flex flex-col justify-between gap-4 md:flex-row md:items-center">
               <div>
-                <h2 className="text-2xl font-bold text-white">发现结果</h2>
+                <h2 className="font-display text-2xl font-bold text-white">发现结果</h2>
                 <p className="mt-1 text-sm text-slate-400">主分类来自原网站导航，网站标签只展示详情页短标签。</p>
               </div>
-              <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-sm text-cyan-100">
+              <span className="font-code rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-sm text-cyan-100">
                 扫描 {result.scannedPages} 页
               </span>
             </div>
-            
+
             <div className="mb-5 flex flex-col gap-4">
               <input
-                className="w-full rounded-2xl border border-white/10 bg-[#080b12]/90 px-4 py-3 text-slate-100 outline-none ring-violet-400/20 transition placeholder:text-slate-500 focus:border-violet-300/40 focus:ring-4"
+                className="input-tech w-full px-4 py-3"
                 placeholder="按小说名、网站分类、网站标签模糊搜索"
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
@@ -391,7 +400,7 @@ function App() {
                         <p className="mt-2 text-sm text-slate-400">{novel.description}</p>
                       </div>
                       <button
-                        className="shrink-0 rounded-2xl border border-emerald-300/30 bg-emerald-300/90 px-5 py-3 font-bold text-slate-950 shadow-[0_0_22px_rgba(52,211,153,0.24)] transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:opacity-60"
+                        className="btn-emerald shrink-0 px-5 py-3"
                         type="button"
                         disabled={loading || Boolean(downloadingUrl)}
                         onClick={() => void scanChapters({
@@ -404,7 +413,7 @@ function App() {
                         {loading && chapterSource?.url === novel.url ? '扫描章节中…' : '扫描章节并下载'}
                       </button>
                     </div>
-                    <p className="mt-2 text-xs text-slate-500 font-mono">{novel.url}</p>
+                    <p className="mt-2 text-xs text-slate-500 font-code">{novel.url}</p>
                     
                     {/* 可点击交互的分类与标签 */}
                     <div className="mt-3 flex flex-wrap gap-2 text-xs items-center">
@@ -494,10 +503,10 @@ function App() {
                       <div className="min-w-0">
                         <h3 className="font-semibold text-cyan-200">{source.siteName}</h3>
                         <p className="mt-1 line-clamp-2 text-sm text-slate-400">{source.description || source.url}</p>
-                        <p className="mt-2 truncate font-mono text-xs text-slate-500">{source.url}</p>
+                        <p className="mt-2 truncate font-code text-xs text-slate-500">{source.url}</p>
                       </div>
                       <button
-                        className="shrink-0 rounded-xl bg-emerald-300 px-5 py-2.5 font-bold text-slate-950 disabled:opacity-60"
+                        className="btn-emerald shrink-0 px-5 py-2.5"
                         type="button"
                         disabled={loading || Boolean(downloadingUrl)}
                         onClick={() => void scanChapters(source, sourceSearchResult.title)}
@@ -583,7 +592,7 @@ function App() {
                           });
                         }}
                       />
-                      <span className="w-12 shrink-0 text-right font-mono text-xs text-slate-500">{index + 1}</span>
+                      <span className="w-12 shrink-0 text-right font-code text-xs text-slate-500">{index + 1}</span>
                       <span>{chapter.title}</span>
                     </label>
                   ))}
@@ -594,7 +603,7 @@ function App() {
             {error && <p className="mt-4 text-sm text-red-300">{error}</p>}
             <div className="mt-5 flex justify-end">
               <button
-                className="rounded-xl bg-emerald-300 px-6 py-3 font-bold text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                className="btn-emerald px-6 py-3"
                 type="button"
                 disabled={Boolean(downloadingUrl) || (chapterMode === 'partial' && selectedChapterUrls.size === 0)}
                 onClick={() => {
@@ -614,32 +623,32 @@ function App() {
       {showLogin && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm">
           <form
-            className="glass-panel w-full max-w-md p-6"
+            className="glass-panel hud reveal w-full max-w-md p-6"
             onSubmit={(event) => {
               event.preventDefault();
               void indexSite({ username, password });
             }}
           >
-            <h2 className="text-2xl font-bold">网站需要登录</h2>
+            <h2 className="font-display text-2xl font-bold">网站需要登录</h2>
             <p className="mt-2 text-sm text-slate-300">请输入该网站账号密码，仅用于本次抓取请求。</p>
             <input
-              className="mt-5 w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+              className="input-tech mt-5 w-full px-4 py-3"
               placeholder="账号"
               value={username}
               onChange={(event) => setUsername(event.target.value)}
             />
             <input
-              className="mt-3 w-full rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 outline-none"
+              className="input-tech mt-3 w-full px-4 py-3"
               placeholder="密码"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
             />
             <div className="mt-5 flex justify-end gap-3">
-              <button className="rounded-xl px-4 py-2 text-slate-300" type="button" onClick={() => setShowLogin(false)}>
+              <button className="rounded-xl px-4 py-2 text-slate-300 transition hover:text-white" type="button" onClick={() => setShowLogin(false)}>
                 取消
               </button>
-              <button className="rounded-xl bg-cyan-400 px-5 py-2 font-bold text-slate-950" disabled={loading}>
+              <button className="btn-neon px-5 py-2" disabled={loading}>
                 登录并抓取
               </button>
             </div>
